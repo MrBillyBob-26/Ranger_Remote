@@ -1,0 +1,209 @@
+import sys
+import time
+
+import pygame
+import serial
+from serial.tools import list_ports
+
+BAUD = 115200
+SEND_HZ = 30
+DEADZONE = 0.15
+
+YAW_RATE = 120.0
+PITCH_RATE = 120.0
+YAW_MIN, YAW_MAX = 0, 200
+PITCH_MIN, PITCH_MAX = 0, 180
+YAW_CENTER = 102.0
+
+FINE = 0.25
+DPAD_STEP = 2.0
+DPAD_DELAY = 0.35
+DPAD_RATE = 60.0
+TRIM_LIMIT = 40
+
+AXIS_LX, AXIS_LY, AXIS_RY, AXIS_RT = 0, 1, 3, 5
+BTN_A, BTN_B, BTN_X, BTN_LB, BTN_RB, BTN_BACK, BTN_START = 0, 1, 2, 4, 5, 6, 7
+
+NANO_NAMES = ("CH340", "USB-SERIAL", "ARDUINO", "USB SERIAL")
+
+
+def deadzone(value):
+    return 0.0 if abs(value) < DEADZONE else value
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def find_port(preferred=None):
+    ports = list(list_ports.comports())
+    if preferred and any(p.device.upper() == preferred.upper() for p in ports):
+        return preferred
+    for p in ports:
+        name = f"{p.description} {p.manufacturer or ''}".upper()
+        if any(n in name for n in NANO_NAMES):
+            return p.device
+    return None
+
+
+class Remote:
+    def __init__(self, preferred=None):
+        pygame.init()
+        pygame.joystick.init()
+        self.preferred = preferred
+        self.pad = pygame.joystick.Joystick(0) if pygame.joystick.get_count() else None
+        print("Controller:", self.pad.get_name() if self.pad else "none yet, plug one in")
+        self.trim = 0
+        self.ser = None
+        self.connect()
+        self.reset_state()
+
+    def reset_state(self):
+        self.yaw = YAW_CENTER
+        self.pitch = 0.0
+        self.laser = False
+        self.sent = (None, None)
+        self.trigger_ready = True
+        self.busy_until = 0.0
+        self.hat = (0, 0)
+        self.hat_since = 0.0
+
+
+    def connect(self):
+        warned = False
+        while True:
+            pygame.event.pump()
+            port = find_port(self.preferred)
+            if port:
+                try:
+                    self.ser = serial.Serial(port, BAUD, timeout=0.01)
+                    time.sleep(2)
+                    self.ser.reset_input_buffer()
+                    print(f"Connected on {port}")
+                    return
+                except serial.SerialException:
+                    pass
+            if not warned:
+                print("Waiting for the robot. Plug in the USB cable and close any serial monitor.")
+                warned = True
+            time.sleep(1)
+
+    def send(self, command):
+        self.ser.write((command + "\n").encode())
+
+    def send_slow(self, command):
+        self.send(command)
+        self.busy_until = time.time() + 10
+
+    def read_robot(self):
+        line = self.ser.readline().decode(errors="ignore").strip()
+        if not line:
+            return
+        print("robot:", line)
+        if line == "READY":
+            self.reset_state()
+            self.send(f"T{self.trim}")
+            print("Remote mode is on, you have control.")
+        elif line.startswith(("OK", "ERR")):
+            self.busy_until = 0.0
+            self.sent = (None, None)
+
+
+    def handle_events(self):
+        for event in pygame.event.get():
+            if event.type == pygame.JOYDEVICEREMOVED:
+                print("Controller unplugged, waiting for it.")
+                self.pad = None
+            elif event.type == pygame.JOYDEVICEADDED and self.pad is None:
+                self.pad = pygame.joystick.Joystick(event.device_index)
+                print("Controller connected:", self.pad.get_name())
+            elif event.type == pygame.JOYBUTTONDOWN and self.pad is not None:
+                self.on_button(event.button)
+
+    def on_button(self, button):
+        if button == BTN_A:
+            self.send_slow("A")
+        elif button == BTN_B:
+            self.yaw, self.pitch = YAW_CENTER, 0.0
+            self.send("R")
+        elif button == BTN_X:
+            self.laser = not self.laser
+            self.send("L1" if self.laser else "L0")
+        elif button in (BTN_START, BTN_BACK):
+            self.trim = clamp(self.trim + (-1 if button == BTN_START else 1), -TRIM_LIMIT, TRIM_LIMIT)
+            self.send(f"T{self.trim}")
+            print(f"Trim {self.trim:+d} (lower lands farther)")
+
+    def aim(self, dt):
+        pad = self.pad
+        speed = FINE if pad.get_button(BTN_LB) or pad.get_button(BTN_RB) else 1.0
+
+        yaw_move = deadzone(pad.get_axis(AXIS_LX)) * YAW_RATE * speed * dt
+        left, right = deadzone(pad.get_axis(AXIS_LY)), deadzone(pad.get_axis(AXIS_RY))
+        stick = left if abs(left) >= abs(right) else right
+        pitch_move = -stick * PITCH_RATE * speed * dt
+
+        hat_x, hat_y = pad.get_hat(0) if pad.get_numhats() else (0, 0)
+        if (hat_x, hat_y) != self.hat:
+            self.hat, self.hat_since = (hat_x, hat_y), time.time()
+            step = DPAD_STEP * (0.5 if speed < 1 else 1)
+            yaw_move += hat_x * step
+            pitch_move += hat_y * step
+        elif (hat_x or hat_y) and time.time() - self.hat_since > DPAD_DELAY:
+            yaw_move += hat_x * DPAD_RATE * speed * dt
+            pitch_move += hat_y * DPAD_RATE * speed * dt
+
+        self.yaw = clamp(self.yaw + yaw_move, YAW_MIN, YAW_MAX)
+        self.pitch = clamp(self.pitch + pitch_move, PITCH_MIN, PITCH_MAX)
+
+        now = (round(self.yaw), round(self.pitch))
+        if now[0] != self.sent[0]:
+            self.send(f"Y{now[0]}")
+        if now[1] != self.sent[1]:
+            self.send(f"P{now[1]}")
+        self.sent = now
+
+    def check_trigger(self):
+        trigger = self.pad.get_axis(AXIS_RT)
+        if trigger > 0.5 and self.trigger_ready:
+            self.send_slow("F")
+            self.trigger_ready = False
+        elif trigger < 0.0:
+            self.trigger_ready = True
+
+
+    def run(self):
+        clock = pygame.time.Clock()
+        print("Pick the purple Remote mode on the robot (arrow buttons, then the middle button).")
+        try:
+            while True:
+                try:
+                    self.handle_events()
+                    if self.pad is not None and time.time() >= self.busy_until:
+                        self.aim(1 / SEND_HZ)
+                        self.check_trigger()
+                    self.read_robot()
+                    clock.tick(SEND_HZ)
+                except (serial.SerialException, OSError):
+                    print("Lost the robot.")
+                    self.close_port()
+                    self.connect()
+                    self.reset_state()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            try:
+                self.send("L0")
+            except Exception:
+                pass
+            self.close_port()
+
+    def close_port(self):
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    Remote(sys.argv[1] if len(sys.argv) > 1 else None).run()
